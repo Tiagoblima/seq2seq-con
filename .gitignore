@@ -5,7 +5,9 @@ __pycache__/
 
 # C extensions
 *.so
-
+seq2seq-venv
+third_party
+data
 # Distribution / packaging
 .Python
 build/
