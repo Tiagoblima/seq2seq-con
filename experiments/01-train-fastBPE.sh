@@ -35,9 +35,9 @@ mkdir -p $SRC_LANG-$TGT_LANG/bpetok/
 
 ../third_party/fastBPE/fast applybpe $SRC_LANG-$STD_LANG/bpetok/valid.src.bpetok $VALID_SRC_TEXT $SRC_LANG-$STD_LANG/bpecodes/src.bpecodes 
 ../third_party/fastBPE/fast applybpe $SRC_LANG-$STD_LANG/bpetok/valid.std.bpetok $VALID_STD_TEXT $SRC_LANG-$STD_LANG/bpecodes/std.bpecodes
-../third_party/fastBPE/fast applybpe $SRC_LANG-$STD_LANG/bpetok/valid.tgt.bpetok $VALID_TGT_TEXT $SRC_LANG-$TGT_LANG/bpecodes/tgt.bpecodes
+../third_party/fastBPE/fast applybpe $SRC_LANG-$TGT_LANG/bpetok/valid.tgt.bpetok $VALID_TGR_TEXT $SRC_LANG-$TGT_LANG/bpecodes/tgt.bpecodes
 
 ../third_party/fastBPE/fast applybpe $SRC_LANG-$STD_LANG/bpetok/test.src.bpetok $TEST_SRC_TEXT $SRC_LANG-$STD_LANG/bpecodes/src.bpecodes 
 ../third_party/fastBPE/fast applybpe $SRC_LANG-$STD_LANG/bpetok/test.std.bpetok $TEST_STD_TEXT $SRC_LANG-$STD_LANG/bpecodes/std.bpecodes 
-../third_party/fastBPE/fast applybpe $SRC_LANG-$STD_LANG/bpetok/test.tgt.bpetok $TEST_STD_TEXT $SRC_LANG-$TGT_LANG/bpecodes/tgt.bpecodes 
+../third_party/fastBPE/fast applybpe $SRC_LANG-$TGT_LANG/bpetok/test.tgt.bpetok $TEST_TGR_TEXT $SRC_LANG-$TGT_LANG/bpecodes/tgt.bpecodes 
 
