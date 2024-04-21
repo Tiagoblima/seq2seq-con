@@ -2,7 +2,7 @@
 STD_LANG="gun"
 SRC_LANG="pt_NVI"
 TGT_LANG="gub"
-VOCAB_SIZE=6000
+VOCAB_SIZE=24000
 
 
 TRAIN_SRC_TEXT=/home/tiagoblima/repos/seq2seq-con/data/preprocessed/texts/$SRC_LANG/train.txt
@@ -19,13 +19,15 @@ TEST_TGR_TEXT=/home/tiagoblima/repos/seq2seq-con/data/preprocessed/texts/$TGT_LA
 
 mkdir -p $SRC_LANG-$STD_LANG/bpecodes/
 mkdir -p $SRC_LANG-$TGT_LANG/bpecodes/
+cat $TRAIN_TGR_TEXT $TRAIN_STD_TEXT > $SRC_LANG-$TGT_LANG/temp/train.std.tgt.text
 
 ../third_party/fastBPE/fast learnbpe $VOCAB_SIZE $TRAIN_SRC_TEXT > $SRC_LANG-$STD_LANG/bpecodes/src.bpecodes
 ../third_party/fastBPE/fast learnbpe $VOCAB_SIZE $TRAIN_STD_TEXT > $SRC_LANG-$STD_LANG/bpecodes/std.bpecodes
-../third_party/fastBPE/fast learnbpe $VOCAB_SIZE $TRAIN_TGR_TEXT > $SRC_LANG-$TGT_LANG/bpecodes/tgt.bpecodes
+../third_party/fastBPE/fast learnbpe $VOCAB_SIZE $TRAIN_STD_TEXT > $SRC_LANG-$TGT_LANG/bpecodes/tgt.bpecodes
 
 mkdir -p $SRC_LANG-$STD_LANG/bpetok/
 mkdir -p $SRC_LANG-$TGT_LANG/bpetok/
+mkdir -p $SRC_LANG-$TGT_LANG/temp/
 #applying BPE codes
 ../third_party/fastBPE/fast applybpe $SRC_LANG-$STD_LANG/bpetok/train.src.bpetok $TRAIN_SRC_TEXT $SRC_LANG-$STD_LANG/bpecodes/src.bpecodes 
 ../third_party/fastBPE/fast applybpe $SRC_LANG-$STD_LANG/bpetok/train.std.bpetok $TRAIN_STD_TEXT $SRC_LANG-$STD_LANG/bpecodes/std.bpecodes 
