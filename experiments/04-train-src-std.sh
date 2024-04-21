@@ -1,9 +1,11 @@
-BASEDIR=../../
-SRCSTD_MODELDIR=./checkpoints
+BASEDIR=../
+SRC_LANG=pt_NVI
+STD_LANG=gun
+SRCSTD_MODELDIR=$SRC_LANG-$STD_LANG/checkpoints
 VALIDSTEPS=2000
-TRAINSTEPS=350000
+TRAINSTEPS=350000 #350000
 SAVESTEPS=50000
-DATADIR=./bin
+DATADIR=$SRC_LANG-$STD_LANG/bin
 LR=0.0007
 
 mkdir -p $SRCSTD_MODELDIR
@@ -24,7 +26,7 @@ python -u $BASEDIR/train.py\
     -train_steps $TRAINSTEPS\
     -max_generator_batches 2\
     -dropout 0.1\
-    -batch_size 2000 \
+    -batch_size 4000 \
     -batch_type tokens\
     -normalization tokens\
     -accum_count 2\
@@ -33,13 +35,13 @@ python -u $BASEDIR/train.py\
     -decay_method linear\
     -weight_decay 0.00001\
     -warmup_steps 1\
-    -learning_rate 1\
+    -learning_rate 1 \
     -max_grad_norm 5.0\
     -param_init 0 \
     -param_init_glorot\
     -label_smoothing 0.1\
     -valid_steps $VALIDSTEPS\
-    -valid_batch_size 2000\
+    -valid_batch_size 4000\
     -save_checkpoint_steps $SAVESTEPS\
     -world_size 1\
     -generator_function continuous-linear\
@@ -47,4 +49,5 @@ python -u $BASEDIR/train.py\
     -generator_layer_norm\
     -lambda_vmf 0.2\
     -share_decoder_embeddings\
-    -gpu_ranks 0
+    -gpu_ranks 0 \
+    -early_stopping 4
