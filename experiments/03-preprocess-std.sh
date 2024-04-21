@@ -10,6 +10,6 @@ python -u ../preprocess.py\
     -valid_tgt $SRC_LANG-$STD_LANG/bpetok/valid.std.bpetok\
     -save_data $SRCSTD_DATADIR/data\
     -tgt_emb $SRC_LANG-$STD_LANG/embeddings/std.vec \
-    -src_seq_length 175\
+    -src_seq_length 175 \
     -tgt_seq_length 175 \
     -overwrite
