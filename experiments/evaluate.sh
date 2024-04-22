@@ -1,7 +1,7 @@
-MOSES_PATH="../../data/mosesdecoder"
+MOSES_PATH="../third_party/mosesdecoder"
 
 sed -r 's/(@@ )|(@@ ?$)//g' < $1 > $1.words
-python ../../scripts/remove_duplicates.py $1.words $1.dedup
+python ../scripts/remove_duplicates.py $1.words $1.dedup
 #sed -r "s/(’)/'/g" < $1.dedup > $1.awords
 #sed -r "s/(' s)/'s/g" < $1.awords > $1.bwords
 #sed -r "s/( s )/ 's /g" < $1.bwords > $1.cwords
