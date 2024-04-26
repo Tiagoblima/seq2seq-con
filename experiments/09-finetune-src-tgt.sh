@@ -1,17 +1,19 @@
 BASEDIR=../
-SRC_LANG=$1
-STD_LANG=$2
+SRC_LANG=eng
+STD_LANG=gun
+TGT_LANG=gub
 SRCSTD_MODELDIR=$SRC_LANG-$STD_LANG/checkpoints
 VALIDSTEPS=2000
 TRAINSTEPS=350000 #350000
 SAVESTEPS=50000
-DATADIR=$SRC_LANG-$STD_LANG/bin
+DATADIR=$SRC_LANG-$TGT_LANG/bin
 LR=0.0007
 
 mkdir -p $SRCSTD_MODELDIR
 python -u $BASEDIR/train.py\
     -data $DATADIR/data \
-    -save_model $SRCSTD_MODELDIR/checkpoint\
+    -save_model $SRC_LANG-$TGT_LANG/checkpoints/ \
+    -initialize_with $SRCSTD_MODELDIR/checkpoint_step_10000.pt \
     -layers 6\
     -rnn_size 512\
     -word_vec_size 512\
@@ -26,7 +28,7 @@ python -u $BASEDIR/train.py\
     -train_steps $TRAINSTEPS\
     -max_generator_batches 2\
     -dropout 0.1\
-    -batch_size 4000 \
+    -batch_size 1000 \
     -batch_type tokens\
     -normalization tokens\
     -accum_count 2\
@@ -41,7 +43,7 @@ python -u $BASEDIR/train.py\
     -param_init_glorot\
     -label_smoothing 0.1\
     -valid_steps $VALIDSTEPS\
-    -valid_batch_size 1000\
+    -valid_batch_size 500 \
     -save_checkpoint_steps $SAVESTEPS\
     -world_size 1\
     -generator_function continuous-linear\
@@ -50,4 +52,4 @@ python -u $BASEDIR/train.py\
     -lambda_vmf 0.2\
     -share_decoder_embeddings\
     -gpu_ranks 0 \
-    -early_stopping 10
+    -early_stopping 4
