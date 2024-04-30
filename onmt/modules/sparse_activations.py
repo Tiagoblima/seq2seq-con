@@ -7,6 +7,7 @@ By Ben Peters and Vlad Niculae
 
 import torch
 from torch.autograd import Function
+from torch.cuda.amp import custom_fwd, custom_bwd
 import torch.nn as nn
 
 
@@ -41,8 +42,8 @@ def _threshold_and_support(input, dim=0):
 
 
 class SparsemaxFunction(Function):
-
     @staticmethod
+    @custom_fwd
     def forward(ctx, input, dim=0):
         """sparsemax: normalizing sparse transform (a la softmax)
 
@@ -62,6 +63,7 @@ class SparsemaxFunction(Function):
         return output
 
     @staticmethod
+    @custom_bwd
     def backward(ctx, grad_output):
         supp_size, output = ctx.saved_tensors
         dim = ctx.dim
@@ -78,7 +80,6 @@ sparsemax = SparsemaxFunction.apply
 
 
 class Sparsemax(nn.Module):
-
     def __init__(self, dim=0):
         self.dim = dim
         super(Sparsemax, self).__init__()
@@ -88,7 +89,6 @@ class Sparsemax(nn.Module):
 
 
 class LogSparsemax(nn.Module):
-
     def __init__(self, dim=0):
         self.dim = dim
         super(LogSparsemax, self).__init__()

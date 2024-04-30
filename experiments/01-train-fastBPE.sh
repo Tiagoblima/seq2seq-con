@@ -1,18 +1,18 @@
 # learning BPE codes
 SRC_LANG="eng"
-STD_LANG="gun"
+STD_LANG="due"
 TGT_LANG="gub"
 VOCAB_SIZE=24000
 BASE_DIR=/home/tiagoblima/repos/seq2seq-con/data/preprocessed/texts/
 
 
-TRAIN_SRC_TEXT=$BASE_DIR/nllb/$SRC_LANG/train.txt
-TRAIN_STD_TEXT=$BASE_DIR/nllb/$STD_LANG/train.txt
+TRAIN_SRC_TEXT=$BASE_DIR/toy/$SRC_LANG/train.txt
+TRAIN_STD_TEXT=$BASE_DIR/toy/$STD_LANG/train.txt
 TRAIN_TGR_TEXT=$BASE_DIR/bible/$TGT_LANG/train.txt
 TRAIN_SRC_TGR_TEXT=$BASE_DIR/bible/$SRC_LANG/train.txt
 
-VALID_SRC_TEXT=$BASE_DIR/nllb/$SRC_LANG/validation.txt
-VALID_STD_TEXT=$BASE_DIR/nllb/$STD_LANG/validation.txt
+VALID_SRC_TEXT=$BASE_DIR/toy/$SRC_LANG/validation.txt
+VALID_STD_TEXT=$BASE_DIR/toy/$STD_LANG/validation.txt
 VALID_TGR_TEXT=$BASE_DIR/bible/$TGT_LANG/validation.txt
 VALID_SRC_TGR_TEXT=$BASE_DIR/bible/$SRC_LANG/validation.txt
 

@@ -26,22 +26,23 @@ python -u $BASEDIR/train.py\
     -train_steps $TRAINSTEPS\
     -max_generator_batches 2\
     -dropout 0.1\
-    -batch_size 4000 \
-    -batch_type tokens\
-    -normalization tokens\
+    -batch_size 16 \
+    -batch_type "sents"\
+    -normalization "sents"\
     -accum_count 2\
     -optim radam\
     -adam_beta2 0.9995\
     -decay_method linear\
     -weight_decay 0.00001\
-    -warmup_steps 1\
+    -warmup_steps 2000 \
     -learning_rate 1 \
+    --learning_rate_decay 0.01 \
     -max_grad_norm 5.0\
     -param_init 0 \
     -param_init_glorot\
     -label_smoothing 0.1\
     -valid_steps $VALIDSTEPS\
-    -valid_batch_size 1000\
+    -valid_batch_size 8\
     -save_checkpoint_steps $SAVESTEPS\
     -world_size 1\
     -generator_function continuous-linear\
@@ -50,4 +51,7 @@ python -u $BASEDIR/train.py\
     -lambda_vmf 0.2\
     -share_decoder_embeddings\
     -gpu_ranks 0 \
-    -early_stopping 10
+    -early_stopping 10 \
+    -model_dtype "fp32" \
+    -tensorboard \
+    --tensorboard_log_dir $SRCSTD_MODELDIR/logs

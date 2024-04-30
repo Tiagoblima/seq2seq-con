@@ -7,14 +7,14 @@ import functools
 from copy import copy
 from math import sqrt
 import types
+import os
 import importlib
-import math
-import numpy as np
 from onmt.utils.misc import fn_args
 
-import logging
-
-logger = logging.getLogger(__name__)
+try:
+    import apex
+except ImportError:
+    pass
 
 
 def build_torch_optimizer(model, opt):
@@ -39,36 +39,9 @@ def build_torch_optimizer(model, opt):
       A ``torch.optim.Optimizer`` instance.
     """
     params = [p for p in model.parameters() if p.requires_grad]
-    if opt.finetune == "adapter" and opt.train_only_adapters:
-        params = np.array(list(model.named_parameters()))
-        zero_grad_mask = []
-        for x in params:
-            name = x[0].lower()
-            # print(name)
-            if "adapter" in name:
-                zero_grad_mask.append(False)
-            elif "copy" in opt.finetune and "encoder.tgt_embeddings.make_embedding" in name:  # need to fix
-                input("yes optim")
-                zero_grad_mask.append(False)
-            else:
-                zero_grad_mask.append(True)
-            
-            # elif opt.new_positional_embeddings and "decoder.embeddings.make_embedding.pe" in name:
-            #     input("yass again")
-            #     zero_grad_mask.append(False)
-
-        zero_grad_mask = np.array(zero_grad_mask)
-        params = params[~zero_grad_mask]
-        params_ = params
-        params = [{"params":[p for n, p in params]}]
-        logger.info([n for n, p in params_])
-        logger.info(
-            f"Number of parameters added to the optimizer: {sum(torch.numel(p) for p in params[0]['params'])}"
-        )
-
     betas = [opt.adam_beta1, opt.adam_beta2]
     if opt.optim == "sgd":
-        optimizer = optim.SGD(list(params), lr=opt.learning_rate)
+        optimizer = optim.SGD(params, lr=opt.learning_rate)
     elif opt.optim == "adagrad":
         optimizer = optim.Adagrad(
             params,
@@ -82,21 +55,7 @@ def build_torch_optimizer(model, opt):
             params, non_constant_decay=True, enable_factorization=True, weight_decay=0
         )
     elif opt.optim == "adam":
-        optimizer = optim.Adam(
-            params,
-            lr=opt.learning_rate,
-            betas=betas,
-            eps=1e-9,
-            weight_decay=opt.weight_decay,
-        )
-    elif opt.optim == "radam":
-        optimizer = RAdam(
-            params,
-            lr=opt.learning_rate,
-            betas=betas,
-            eps=1e-9,
-            weight_decay=opt.weight_decay,
-        )
+        optimizer = optim.Adam(params, lr=opt.learning_rate, betas=betas, eps=1e-8)
     elif opt.optim == "sparseadam":
         dense = []
         sparse = []
@@ -115,16 +74,13 @@ def build_torch_optimizer(model, opt):
             ]
         )
     elif opt.optim == "fusedadam":
-        # we use here a FusedAdam() copy of an old Apex repo
         optimizer = FusedAdam(params, lr=opt.learning_rate, betas=betas)
-    else:
-        raise ValueError("Invalid optimizer type: " + opt.optim)
-
-    if opt.model_dtype == "fp16":
-        import apex
-
-        if opt.optim != "fusedadam":
-            # In this case use the new AMP API from apex
+        try:
+            import apex
+        except ImportError:
+            raise ImportError("Could not import apex")
+        if opt.apex_opt_level in ["O0", "O1", "O2", "O3"]:
+            # we use apex.amp
             loss_scale = "dynamic" if opt.loss_scale == 0 else opt.loss_scale
             model, optimizer = apex.amp.initialize(
                 [model, model.generator],
@@ -134,14 +90,70 @@ def build_torch_optimizer(model, opt):
                 keep_batchnorm_fp32=None,
             )
         else:
-            # In this case use the old FusedAdam with FP16_optimizer wrapper
-            static_loss_scale = opt.loss_scale
-            dynamic_loss_scale = opt.loss_scale == 0
-            optimizer = apex.optimizers.FP16_Optimizer(
-                optimizer,
-                static_loss_scale=static_loss_scale,
-                dynamic_loss_scale=dynamic_loss_scale,
+            if opt.model_dtype == "fp16":
+                # In this case use the old FusedAdam with
+                # FP16_optimizer wrapper
+                static_loss_scale = opt.loss_scale
+                dynamic_loss_scale = opt.loss_scale == 0
+                optimizer = apex.contrib.optimizers.FP16_Optimizer(
+                    optimizer,
+                    static_loss_scale=static_loss_scale,
+                    dynamic_loss_scale=dynamic_loss_scale,
+                )
+    elif opt.optim in ["adamw8bit", "pagedadamw8bit", "pagedadamw32bit"]:
+        try:
+            os.environ["BITSANDBYTES_NOWELCOME"] = "1"
+            import bitsandbytes as bnb
+        except ImportError:
+            raise ImportError("Install bitsandbytes to use bnb optimizers")
+        if opt.optim == "adamw8bit":
+            optimizer = bnb.optim.AdamW8bit(
+                params,
+                lr=opt.learning_rate,
+                betas=betas,
+                eps=1e-8,
+                weight_decay=1e-2,
+                amsgrad=False,
+                optim_bits=8,
+                args=None,
+                min_8bit_size=1024,
+                percentile_clipping=100,
+                block_wise=True,
+                is_paged=False,
             )
+        elif opt.optim == "pagedadamw8bit":
+            optimizer = bnb.optim.PagedAdamW8bit(
+                params,
+                lr=opt.learning_rate,
+                betas=betas,
+                eps=1e-8,
+                weight_decay=1e-2,
+                amsgrad=False,
+                optim_bits=8,
+                args=None,
+                min_8bit_size=4096,
+                percentile_clipping=100,
+                block_wise=True,
+            )
+        elif opt.optim == "pagedadamw32bit":
+            optimizer = bnb.optim.PagedAdamW32bit(
+                params,
+                lr=opt.learning_rate,
+                betas=betas,
+                eps=1e-8,
+                weight_decay=1e-2,
+                amsgrad=False,
+                optim_bits=32,
+                args=None,
+                min_8bit_size=4096,
+                percentile_clipping=100,
+                block_wise=True,
+            )
+        else:
+            raise ValueError("Invalid optimizer type: " + opt.optim)
+    else:
+        raise ValueError("Invalid optimizer type: " + opt.optim)
+
     return optimizer
 
 
@@ -149,28 +161,19 @@ def make_learning_rate_decay_fn(opt):
     """Returns the learning decay function from options."""
     if opt.decay_method == "noam":
         return functools.partial(
-            noam_decay, warmup_steps=opt.warmup_steps, model_size=opt.rnn_size
+            noam_decay, warmup_steps=opt.warmup_steps, model_size=opt.hidden_size
         )
     elif opt.decay_method == "noamwd":
         return functools.partial(
             noamwd_decay,
             warmup_steps=opt.warmup_steps,
-            model_size=opt.rnn_size,
+            model_size=opt.hidden_size,
             rate=opt.learning_rate_decay,
             decay_steps=opt.decay_steps,
             start_step=opt.start_decay_steps,
         )
     elif opt.decay_method == "rsqrt":
         return functools.partial(rsqrt_decay, warmup_steps=opt.warmup_steps)
-    elif opt.decay_method == "linear":
-        return functools.partial(
-            linear_decay,
-            warmup_steps=opt.warmup_steps,
-            warmup_end_lr=opt.warmup_end_lr,
-            warmup_init_lr=opt.warmup_init_lr,
-            max_update=opt.train_steps,
-            min_lr=opt.min_lr,
-        )
     elif opt.start_decay_steps is not None:
         return functools.partial(
             exponential_decay,
@@ -203,26 +206,16 @@ def exponential_decay(step, rate, decay_steps, start_step=0):
     return rate ** (max(step - start_step + decay_steps, 0) // decay_steps)
 
 
-def linear_decay(step, min_lr, warmup_steps, warmup_init_lr, warmup_end_lr, max_update):
-    lr_step = (warmup_end_lr - warmup_init_lr) / warmup_steps
-    if step < warmup_steps:
-        return warmup_init_lr + step * lr_step
-    else:
-        return (warmup_end_lr - min_lr) * (
-            1 - (step - warmup_steps) / (max_update - warmup_steps)
-        ) + min_lr
-
-
 def rsqrt_decay(step, warmup_steps):
     """Decay based on the reciprocal of the step square root."""
     return 1.0 / sqrt(max(step, warmup_steps))
 
 
 class MultipleOptimizer(object):
-    """ Implement multiple optimizers needed for sparse adam """
+    """Implement multiple optimizers needed for sparse adam"""
 
     def __init__(self, op):
-        """ ? """
+        """?"""
         self.optimizers = op
 
     @property
@@ -232,27 +225,27 @@ class MultipleOptimizer(object):
             param_groups.extend(optimizer.param_groups)
         return param_groups
 
-    def zero_grad(self):
-        """ ? """
+    def zero_grad(self, set_to_none=True):
+        """?"""
         for op in self.optimizers:
-            op.zero_grad()
+            op.zero_grad(set_to_none)
 
     def step(self):
-        """ ? """
+        """?"""
         for op in self.optimizers:
             op.step()
 
     @property
     def state(self):
-        """ ? """
+        """?"""
         return {k: v for op in self.optimizers for k, v in op.state.items()}
 
     def state_dict(self):
-        """ ? """
+        """?"""
         return [op.state_dict() for op in self.optimizers]
 
     def load_state_dict(self, state_dicts):
-        """ ? """
+        """?"""
         assert len(state_dicts) == len(self.optimizers)
         for i in range(len(state_dicts)):
             self.optimizers[i].load_state_dict(state_dicts[i])
@@ -265,25 +258,18 @@ class Optimizer(object):
     rate scheduling beyond what is currently available.
     Also implements necessary methods for training RNNs such
     as grad manipulations.
+
+    Args:
+        optimizer: A ``torch.optim.Optimizer`` instance.
+        learning_rate: The initial learning rate.
+        learning_rate_decay_fn: An optional callable taking the current step
+            as argument and return a learning rate scaling factor.
+        max_grad_norm: Clip gradients to this global norm.
     """
 
     def __init__(
-        self,
-        optimizer,
-        learning_rate,
-        learning_rate_decay_fn=None,
-        decay_method=None,
-        max_grad_norm=None,
+        self, optimizer, learning_rate, learning_rate_decay_fn=None, max_grad_norm=None
     ):
-        """Initializes the controller.
-
-        Args:
-          optimizer: A ``torch.optim.Optimizer`` instance.
-          learning_rate: The initial learning rate.
-          learning_rate_decay_fn: An optional callable taking the current step
-            as argument and return a learning rate scaling factor.
-          max_grad_norm: Clip gradients to this global norm.
-        """
         self._optimizer = optimizer
         self._learning_rate = learning_rate
         self._learning_rate_decay_fn = learning_rate_decay_fn
@@ -291,6 +277,7 @@ class Optimizer(object):
         self._training_step = 1
         self._decay_step = 1
         self._fp16 = None
+        self._scaler = None
 
     @classmethod
     def from_opt(cls, model, opt, checkpoint=None):
@@ -308,8 +295,7 @@ class Optimizer(object):
         optim_opt = opt
         optim_state_dict = None
 
-        if checkpoint is not None and (opt.train_from or (opt.initialize_with and opt.finetune == "regular")):
-            logger.info("loading optimizer from checkpoint")
+        if opt.train_from and checkpoint is not None and "optim" in checkpoint.keys():
             optim = checkpoint["optim"]
             ckpt_opt = checkpoint["opt"]
             ckpt_state_dict = {}
@@ -340,14 +326,19 @@ class Optimizer(object):
             build_torch_optimizer(model, optim_opt),
             optim_opt.learning_rate,
             learning_rate_decay_fn=make_learning_rate_decay_fn(optim_opt),
-            decay_method=opt.decay_method,
             max_grad_norm=optim_opt.max_grad_norm,
         )
         if opt.model_dtype == "fp16":
             if opt.optim == "fusedadam":
-                optimizer._fp16 = "legacy"
+                if opt.apex_opt_level in ["O0", "O1", "O2", "O3"]:
+                    optimizer._fp16 = "apex.amp"
+                else:
+                    optimizer._fp16 = "legacy"
             else:
                 optimizer._fp16 = "amp"
+                from torch.cuda.amp import GradScaler
+
+                optimizer._scaler = GradScaler()
         if optim_state_dict:
             optimizer.load_state_dict(optim_state_dict)
         return optimizer
@@ -357,13 +348,16 @@ class Optimizer(object):
         """The current training step."""
         return self._training_step
 
+    @property
+    def amp(self):
+        """True if use torch amp mix precision training."""
+        return self._fp16 == "amp"
+
     def learning_rate(self):
         """Returns the current learning rate."""
         if self._learning_rate_decay_fn is None:
             return self._learning_rate
         scale = self._learning_rate_decay_fn(self._decay_step)
-        # if (self._decay_step % 100 == 0):
-        #     print('scale =',scale)
         return scale * self._learning_rate
 
     def state_dict(self):
@@ -381,23 +375,26 @@ class Optimizer(object):
         if "optimizer" in state_dict:
             self._optimizer.load_state_dict(state_dict["optimizer"])
 
-    def zero_grad(self):
+    def zero_grad(self, set_to_none=True):
         """Zero the gradients of optimized parameters."""
         self._optimizer.zero_grad()
+        # should be: self._optimizer.zero_grad(set_to_none)
+        # but apex.amp is not up-to-date:
+        # https://github.com/NVIDIA/apex/blob/master/apex/amp/_process_optimizer.py#L367
 
     def backward(self, loss):
         """Wrapper for backward pass. Some optimizer requires ownership of the
         backward pass."""
-        if self._fp16 == "amp":
-            import apex
-
-            with apex.amp.scale_loss(loss, self._optimizer) as scaled_loss:
-                scaled_loss.backward()
-        elif self._fp16 == "legacy":
+        if self._fp16 == "legacy":
             kwargs = {}
             if "update_master_grads" in fn_args(self._optimizer.backward):
                 kwargs["update_master_grads"] = True
             self._optimizer.backward(loss, **kwargs)
+        elif self.amp:
+            self._scaler.scale(loss).backward()
+        elif self._fp16 == "apex.amp":
+            with apex.amp.scale_loss(loss, self._optimizer) as scaled_loss:
+                scaled_loss.backward()
         else:
             loss.backward()
 
@@ -408,7 +405,10 @@ class Optimizer(object):
         rate.
         """
         learning_rate = self.learning_rate()
-        if self._fp16 == "legacy":
+
+        if self.amp:
+            self._scaler.unscale_(self._optimizer)
+        elif self._fp16 == "legacy":
             if hasattr(self._optimizer, "update_master_grads"):
                 self._optimizer.update_master_grads()
             if (
@@ -419,9 +419,17 @@ class Optimizer(object):
 
         for group in self._optimizer.param_groups:
             group["lr"] = learning_rate
-            if self._fp16 is None and self._max_grad_norm > 0:
+            if self._max_grad_norm > 0 and self._fp16 != "legacy":
                 clip_grad_norm_(group["params"], self._max_grad_norm)
-        self._optimizer.step()
+
+        if self.amp:
+            # unscaled optimizer's gradients (already done therefore skip),
+            # skips optimizer.step() if gradients contain infs/NaNs.
+            self._scaler.step(self._optimizer)
+            # Updates the scale for next iteration.
+            self._scaler.update()
+        else:
+            self._optimizer.step()
         self._decay_step += 1
         self._training_step += 1
 
@@ -445,7 +453,6 @@ class AdaFactor(torch.optim.Optimizer):
         ams_grad=True,
         weight_decay=0,
     ):
-
         enable_momentum = beta1 != 0
 
         if non_constant_decay:
@@ -643,8 +650,8 @@ class FusedAdam(torch.optim.Optimizer):
 
     """Implements Adam algorithm. Currently GPU-only.
        Requires Apex to be installed via
-    ``python setup.py install --cuda_ext --cpp_ext``.
-    It has been proposed in `Adam: A Method for Stochastic Optimization`_.
+       ``python setup.py install --cuda_ext --cpp_ext``.
+
     Arguments:
         params (iterable): iterable of parameters to optimize or dicts defining
             parameter groups.
@@ -656,16 +663,12 @@ class FusedAdam(torch.optim.Optimizer):
             numerical stability. (default: 1e-8)
         weight_decay (float, optional): weight decay (L2 penalty) (default: 0)
         amsgrad (boolean, optional): whether to use the AMSGrad variant of this
-            algorithm from the paper `On the Convergence of Adam and Beyond`_
+            algorithm from the paper 'On the Convergence of Adam and Beyond'
             (default: False) NOT SUPPORTED in FusedAdam!
         eps_inside_sqrt (boolean, optional): in the 'update parameters' step,
             adds eps to the bias-corrected second moment estimate before
             evaluating square root instead of adding it to the square root of
             second moment estimate as in the original paper. (default: False)
-    .. _Adam: A Method for Stochastic Optimization:
-        https://arxiv.org/abs/1412.6980
-    .. _On the Convergence of Adam and Beyond:
-        https://openreview.net/forum?id=ryQu7f-RZ
     """
 
     def __init__(
@@ -700,6 +703,7 @@ class FusedAdam(torch.optim.Optimizer):
         self, closure=None, grads=None, output_params=None, scale=1.0, grad_norms=None
     ):
         """Performs a single optimization step.
+
         Arguments:
             closure (callable, optional): A closure that reevaluates the model
                 and returns the loss.
@@ -810,306 +814,4 @@ class FusedAdam(torch.optim.Optimizer):
                     bias_correction,
                     group["weight_decay"],
                 )
-        return loss
-
-
-class RAdam(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr=1e-3,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0,
-        degenerated_to_sgd=True,
-    ):
-        if not 0.0 <= lr:
-            raise ValueError("Invalid learning rate: {}".format(lr))
-        if not 0.0 <= eps:
-            raise ValueError("Invalid epsilon value: {}".format(eps))
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
-
-        self.degenerated_to_sgd = degenerated_to_sgd
-        if (
-            isinstance(params, (list, tuple))
-            and len(params) > 0
-            and isinstance(params[0], dict)
-        ):
-            for param in params:
-                if "betas" in param and (
-                    param["betas"][0] != betas[0] or param["betas"][1] != betas[1]
-                ):
-                    param["buffer"] = [[None, None, None] for _ in range(10)]
-        defaults = dict(
-            lr=lr,
-            betas=betas,
-            eps=eps,
-            weight_decay=weight_decay,
-            buffer=[[None, None, None] for _ in range(10)],
-        )
-        super(RAdam, self).__init__(params, defaults)
-
-    def __setstate__(self, state):
-        super(RAdam, self).__setstate__(state)
-
-    def step(self, closure=None):
-
-        loss = None
-        if closure is not None:
-            loss = closure()
-
-        for group in self.param_groups:
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data.float()
-                if grad.is_sparse:
-                    raise RuntimeError("RAdam does not support sparse gradients")
-
-                p_data_fp32 = p.data.float()
-
-                state = self.state[p]
-
-                if len(state) == 0:
-                    state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(p_data_fp32)
-                    state["exp_avg_sq"] = torch.zeros_like(p_data_fp32)
-                else:
-                    state["exp_avg"] = state["exp_avg"].type_as(p_data_fp32)
-                    state["exp_avg_sq"] = state["exp_avg_sq"].type_as(p_data_fp32)
-
-                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-                beta1, beta2 = group["betas"]
-
-                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
-                exp_avg.mul_(beta1).add_(1 - beta1, grad)
-
-                state["step"] += 1
-                buffered = group["buffer"][int(state["step"] % 10)]
-                if state["step"] == buffered[0]:
-                    N_sma, step_size = buffered[1], buffered[2]
-                else:
-                    buffered[0] = state["step"]
-                    beta2_t = beta2 ** state["step"]
-                    N_sma_max = 2 / (1 - beta2) - 1
-                    N_sma = N_sma_max - 2 * state["step"] * beta2_t / (1 - beta2_t)
-                    buffered[1] = N_sma
-
-                    # more conservative since it's an approximated value
-                    if N_sma >= 5:
-                        step_size = math.sqrt(
-                            (1 - beta2_t)
-                            * (N_sma - 4)
-                            / (N_sma_max - 4)
-                            * (N_sma - 2)
-                            / N_sma
-                            * N_sma_max
-                            / (N_sma_max - 2)
-                        ) / (1 - beta1 ** state["step"])
-                    elif self.degenerated_to_sgd:
-                        step_size = 1.0 / (1 - beta1 ** state["step"])
-                    else:
-                        step_size = -1
-                    buffered[2] = step_size
-
-                # more conservative since it's an approximated value
-                if N_sma >= 5:
-                    if group["weight_decay"] != 0:
-                        p_data_fp32.add_(
-                            -group["weight_decay"] * group["lr"], p_data_fp32
-                        )
-                    denom = exp_avg_sq.sqrt().add_(group["eps"])
-                    p_data_fp32.addcdiv_(-step_size * group["lr"], exp_avg, denom)
-                    p.data.copy_(p_data_fp32)
-                elif step_size > 0:
-                    if group["weight_decay"] != 0:
-                        p_data_fp32.add_(
-                            -group["weight_decay"] * group["lr"], p_data_fp32
-                        )
-                    p_data_fp32.add_(-step_size * group["lr"], exp_avg)
-                    p.data.copy_(p_data_fp32)
-
-        return loss
-
-
-class PlainRAdam(torch.optim.Optimizer):
-    def __init__(
-        self,
-        params,
-        lr=1e-3,
-        betas=(0.9, 0.999),
-        eps=1e-8,
-        weight_decay=0,
-        degenerated_to_sgd=True,
-    ):
-        if not 0.0 <= lr:
-            raise ValueError("Invalid learning rate: {}".format(lr))
-        if not 0.0 <= eps:
-            raise ValueError("Invalid epsilon value: {}".format(eps))
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
-
-        self.degenerated_to_sgd = degenerated_to_sgd
-        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
-
-        super(PlainRAdam, self).__init__(params, defaults)
-
-    def __setstate__(self, state):
-        super(PlainRAdam, self).__setstate__(state)
-
-    def step(self, closure=None):
-
-        loss = None
-        if closure is not None:
-            loss = closure()
-
-        for group in self.param_groups:
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data.float()
-                if grad.is_sparse:
-                    raise RuntimeError("RAdam does not support sparse gradients")
-
-                p_data_fp32 = p.data.float()
-
-                state = self.state[p]
-
-                if len(state) == 0:
-                    state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(p_data_fp32)
-                    state["exp_avg_sq"] = torch.zeros_like(p_data_fp32)
-                else:
-                    state["exp_avg"] = state["exp_avg"].type_as(p_data_fp32)
-                    state["exp_avg_sq"] = state["exp_avg_sq"].type_as(p_data_fp32)
-
-                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-                beta1, beta2 = group["betas"]
-
-                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
-                exp_avg.mul_(beta1).add_(1 - beta1, grad)
-
-                state["step"] += 1
-                beta2_t = beta2 ** state["step"]
-                N_sma_max = 2 / (1 - beta2) - 1
-                N_sma = N_sma_max - 2 * state["step"] * beta2_t / (1 - beta2_t)
-
-                # more conservative since it's an approximated value
-                if N_sma >= 5:
-                    if group["weight_decay"] != 0:
-                        p_data_fp32.add_(
-                            -group["weight_decay"] * group["lr"], p_data_fp32
-                        )
-                    step_size = (
-                        group["lr"]
-                        * math.sqrt(
-                            (1 - beta2_t)
-                            * (N_sma - 4)
-                            / (N_sma_max - 4)
-                            * (N_sma - 2)
-                            / N_sma
-                            * N_sma_max
-                            / (N_sma_max - 2)
-                        )
-                        / (1 - beta1 ** state["step"])
-                    )
-                    denom = exp_avg_sq.sqrt().add_(group["eps"])
-                    p_data_fp32.addcdiv_(-step_size, exp_avg, denom)
-                    p.data.copy_(p_data_fp32)
-                elif self.degenerated_to_sgd:
-                    if group["weight_decay"] != 0:
-                        p_data_fp32.add_(
-                            -group["weight_decay"] * group["lr"], p_data_fp32
-                        )
-                    step_size = group["lr"] / (1 - beta1 ** state["step"])
-                    p_data_fp32.add_(-step_size, exp_avg)
-                    p.data.copy_(p_data_fp32)
-
-        return loss
-
-
-class AdamW(torch.optim.Optimizer):
-    def __init__(
-        self, params, lr=1e-3, betas=(0.9, 0.999), eps=1e-8, weight_decay=0, warmup=0
-    ):
-        if not 0.0 <= lr:
-            raise ValueError("Invalid learning rate: {}".format(lr))
-        if not 0.0 <= eps:
-            raise ValueError("Invalid epsilon value: {}".format(eps))
-        if not 0.0 <= betas[0] < 1.0:
-            raise ValueError("Invalid beta parameter at index 0: {}".format(betas[0]))
-        if not 0.0 <= betas[1] < 1.0:
-            raise ValueError("Invalid beta parameter at index 1: {}".format(betas[1]))
-
-        defaults = dict(
-            lr=lr, betas=betas, eps=eps, weight_decay=weight_decay, warmup=warmup
-        )
-        super(AdamW, self).__init__(params, defaults)
-
-    def __setstate__(self, state):
-        super(AdamW, self).__setstate__(state)
-
-    def step(self, closure=None):
-        loss = None
-        if closure is not None:
-            loss = closure()
-
-        for group in self.param_groups:
-
-            for p in group["params"]:
-                if p.grad is None:
-                    continue
-                grad = p.grad.data.float()
-                if grad.is_sparse:
-                    raise RuntimeError(
-                        "Adam does not support sparse gradients, please consider SparseAdam instead"
-                    )
-
-                p_data_fp32 = p.data.float()
-
-                state = self.state[p]
-
-                if len(state) == 0:
-                    state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(p_data_fp32)
-                    state["exp_avg_sq"] = torch.zeros_like(p_data_fp32)
-                else:
-                    state["exp_avg"] = state["exp_avg"].type_as(p_data_fp32)
-                    state["exp_avg_sq"] = state["exp_avg_sq"].type_as(p_data_fp32)
-
-                exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
-                beta1, beta2 = group["betas"]
-
-                state["step"] += 1
-
-                exp_avg_sq.mul_(beta2).addcmul_(1 - beta2, grad, grad)
-                exp_avg.mul_(beta1).add_(1 - beta1, grad)
-
-                denom = exp_avg_sq.sqrt().add_(group["eps"])
-                bias_correction1 = 1 - beta1 ** state["step"]
-                bias_correction2 = 1 - beta2 ** state["step"]
-
-                if group["warmup"] > state["step"]:
-                    scheduled_lr = 1e-8 + state["step"] * group["lr"] / group["warmup"]
-                else:
-                    scheduled_lr = group["lr"]
-
-                step_size = (
-                    scheduled_lr * math.sqrt(bias_correction2) / bias_correction1
-                )
-
-                if group["weight_decay"] != 0:
-                    p_data_fp32.add_(-group["weight_decay"] * scheduled_lr, p_data_fp32)
-
-                p_data_fp32.addcdiv_(-step_size, exp_avg, denom)
-
-                p.data.copy_(p_data_fp32)
-
         return loss

@@ -2,77 +2,54 @@
 This file is for models creation, which consults options
 and creates each encoder and decoder accordingly.
 """
-import re
 import torch
 import torch.nn as nn
-from torch.nn.init import xavier_uniform_
-
-import onmt.inputters as inputters
-import onmt.modules
+from torch.nn.utils import skip_init
+from torch.nn.init import xavier_uniform_, zeros_, uniform_
+from onmt.models.model import NMTModel, LanguageModel
 from onmt.encoders import str2enc
-
 from onmt.decoders import str2dec
-
-from onmt.modules import (
-    Embeddings,
-    VecEmbedding,
-    CopyGenerator,
-    JLMap,
-    InvertibleMap,
-    AdapterLayer,
-)
-from onmt.modules.util_class import Cast
+from onmt.inputters.inputter import dict_to_vocabs
+from onmt.modules import Embeddings, CopyGenerator
 from onmt.utils.misc import use_gpu
-
-# from onmt.utils.logging import logger
+from onmt.utils.logging import logger
 from onmt.utils.parse import ArgumentParser
+from onmt.models.model_saver import load_checkpoint
+from onmt.constants import DefaultTokens, ModelTask
+from onmt.modules.lora import (
+    replace_lora_linear,
+    replace_lora_embedding,
+    mark_only_lora_as_trainable,
+)
 
-import logging
 
-logger = logging.getLogger(__name__)
-
-
-def build_embeddings(opt, text_field, for_encoder=True, copy_and_init=False):
+def build_embeddings(opt, vocabs, for_encoder=True):
     """
     Args:
         opt: the option in current environment.
-        text_field(TextMultiField): word and feats field.
+        vocab.
         for_encoder(bool): build Embeddings for encoder or decoder?
     """
-    emb_dim = opt.src_word_vec_size if for_encoder and not copy_and_init else opt.tgt_word_vec_size
-
-    if opt.model_type == "vec" and for_encoder:
-        return VecEmbedding(
-            opt.feat_vec_size,
-            emb_dim,
-            position_encoding=opt.position_encoding,
-            dropout=(opt.dropout[0] if type(opt.dropout) is list else opt.dropout),
-        )
-
-    if opt.use_feat_emb:
-        num_embs = [len(f.vocab) for _, f in text_field]
-        pad_indices = [f.vocab.stoi[f.pad_token] for _, f in text_field]
+    feat_pad_indices = []
+    num_feat_embeddings = []
+    if for_encoder:
+        emb_dim = opt.src_word_vec_size
+        word_padding_idx = vocabs["src"][DefaultTokens.PAD]
+        num_word_embeddings = len(vocabs["src"])
+        if "src_feats" in vocabs:
+            feat_pad_indices = [fv[DefaultTokens.PAD] for fv in vocabs["src_feats"]]
+            num_feat_embeddings = [len(fv) for fv in vocabs["src_feats"]]
+        freeze_word_vecs = opt.freeze_word_vecs_enc
     else:
-        num_embs = [len(f.vocab) for _, f in text_field][:1]
-        pad_indices = [f.vocab.stoi[f.pad_token] for _, f in text_field][:1]
-
-    num_word_embeddings, num_feat_embeddings = num_embs[0], num_embs[1:]
-    word_padding_idx, feat_pad_indices = pad_indices[0], pad_indices[1:]
-
-    fix_word_vecs = opt.fix_word_vecs_enc if for_encoder else opt.fix_word_vecs_dec
-
-    conmt = False
-    out_vec_size = None
-    if for_encoder and copy_and_init:
-        out_vec_size = text_field.base_field.vocab.vectors.size(1)
-
-    elif ("continuous" in opt.generator_function) and not for_encoder:
-        out_vec_size = text_field.base_field.vocab.vectors.size(1)
-        conmt = True
+        emb_dim = opt.tgt_word_vec_size
+        word_padding_idx = vocabs["tgt"][DefaultTokens.PAD]
+        num_word_embeddings = len(vocabs["tgt"])
+        freeze_word_vecs = opt.freeze_word_vecs_dec
 
     emb = Embeddings(
         word_vec_size=emb_dim,
         position_encoding=opt.position_encoding,
+        position_encoding_type=opt.position_encoding_type,
         feat_merge=opt.feat_merge,
         feat_vec_exponent=opt.feat_vec_exponent,
         feat_vec_size=opt.feat_vec_size,
@@ -82,28 +59,20 @@ def build_embeddings(opt, text_field, for_encoder=True, copy_and_init=False):
         word_vocab_size=num_word_embeddings,
         feat_vocab_sizes=num_feat_embeddings,
         sparse=opt.optim == "sparseadam",
-        fix_word_vecs=fix_word_vecs,
-        tie_embeddings=opt.share_decoder_embeddings and conmt,
-        out_vec_size=out_vec_size,
-        adapt_embeddings=opt.adapt_embeddings and not for_encoder,
+        freeze_word_vecs=freeze_word_vecs,
     )
     return emb
 
 
-def build_encoder(opt, embeddings, tgt_embeddings=None):
+def build_encoder(opt, embeddings):
     """
     Various encoder dispatcher function.
     Args:
         opt: the option in current environment.
         embeddings (Embeddings): vocab embeddings for this encoder.
     """
-    enc_type = (
-        opt.encoder_type
-        if opt.model_type == "text" or opt.model_type == "vec"
-        else opt.model_type
-    )
-    print (str2enc[enc_type])
-    return str2enc[enc_type].from_opt(opt, embeddings, tgt_embeddings)
+    enc_type = opt.encoder_type if opt.model_type == "text" else opt.model_type
+    return str2enc[enc_type].from_opt(opt, embeddings)
 
 
 def build_decoder(opt, embeddings):
@@ -119,446 +88,215 @@ def build_decoder(opt, embeddings):
     return str2dec[dec_type].from_opt(opt, embeddings)
 
 
-def build_generator(opt, fields, output_vec_dim=-1, device=torch.device("cpu")):
-    # Build Generator.
-    if not opt.copy_attn:
-        if opt.generator_function == "continuous-linear":
-            generator_modules = [nn.Linear(opt.dec_rnn_size, output_vec_dim)]
-            if opt.predict_map:
-                generator_modules.append(
-                    build_jlmapping(output_vec_dim, True, True, False, device=device)
-                )
-            if opt.generator_layer_norm:
-                generator_modules.append(nn.LayerNorm(output_vec_dim, eps=1e-6))
-            if opt.adapt_embeddings:
-                generator_modules.append(AdapterLayer(output_vec_dim, 0, 0.0))
-            generator = nn.Sequential(*generator_modules)
-
-        elif (
-            opt.generator_function == "continuous-nonlinear"
-        ):  # add a non-linear layer before generating the continuous vector
-            generator_modules = [
-                nn.Linear(opt.dec_rnn_size, output_vec_dim),
-                nn.ReLU(),
-                nn.Linear(output_vec_dim, output_vec_dim),
-            ]
-            if opt.generator_layer_norm:
-                generator_modules.append(nn.LayerNorm(output_vec_dim, eps=1e-6))
-            generator = nn.Sequential(*generator_modules)
-        else:
-            if opt.generator_function == "sparsemax":
-                gen_func = onmt.modules.sparse_activations.LogSparsemax(dim=-1)
-            else:
-                gen_func = nn.LogSoftmax(dim=-1)
-            generator = nn.Sequential(
-                nn.Linear(opt.dec_rnn_size, len(fields["tgt"].base_field.vocab)),
-                Cast(torch.float32),
-                gen_func,
-            )
-            if opt.share_decoder_embeddings:
-                generator[0].weight = decoder.embeddings.word_lut.weight
-    else:
-        tgt_base_field = fields["tgt"].base_field
-        vocab_size = len(tgt_base_field.vocab)
-        pad_idx = tgt_base_field.vocab.stoi[tgt_base_field.pad_token]
-        generator = CopyGenerator(opt.dec_rnn_size, vocab_size, pad_idx)
-
-    mtl_generator = None
-    if opt.multi_task:
-        if len(fields["tgt"].fields) > 1:
-            secondary_task_vocab = len(fields["tgt"].fields[1][1].vocab)
-            mtl_generator = nn.Sequential(
-                nn.Linear(opt.dec_rnn_size, secondary_task_vocab), nn.LogSoftmax(dim=-1)
-            )
-        else:
-            logger.info(
-                "multitask is set but data doesn't contain multitask labels. Ignoring"
-            )
-
-    return generator, mtl_generator
-
-
-# def build_jlmapping(opt, output_vec_dim, map_id_init=False, trainable=False, use_noise=False, device=torch.device("cpu")):
-#     return JLMap(output_vec_dim, map_id_init, trainable, use_noise, device=device)
-
-
-def build_mapping(output_vec_dim, opt, device):
-    if opt.emb_map == "invertible":
-        x = InvertibleMap(
-            output_vec_dim,
-            output_vec_dim // 2,
-            opt.coupling_layers,
-            opt.cell_layers,
-            device,
-        )
-        return x
-    elif opt.emb_map == "orthogonal":
-        return JLMap(
-            output_vec_dim,
-            map_id_init=opt.map_id_init,
-            trainable=True,
-            use_noise=opt.jl_noise,
-            device=device,
-        )
-    else:
-        return JLMap(
-            output_vec_dim,
-            map_id_init=True,
-            trainable=False,
-            use_noise=False,
-            device=device,
-        )
-
-
-# def compare_vocab(v1, v2):
-#     v1 = dict(v1)
-#     v2 = dict(v2)
-#     v1src = v1['src']
-#     v1tgt = v1['tgt']
-
-#     v2src = v2['src']
-#     v2tgt = v2['tgt']
-
-#     print(v1src)
-#     print(v1tgt)
-#     input()
-
-
-def load_test_model(opt, model_path=None):
+def load_test_model(opt, device_id=0, model_path=None):
     if model_path is None:
         model_path = opt.models[0]
-    checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage)
+    checkpoint = load_checkpoint(model_path)
 
     model_opt = ArgumentParser.ckpt_model_opts(checkpoint["opt"])
+
+    if hasattr(model_opt, "quant_type") and model_opt.quant_type in [
+        "awq_gemm",
+        "awq_gemv",
+    ]:  # if the loaded model is a awq quantized one, inference config cannot overwrite this
+        if (
+            hasattr(opt, "quant_type")
+            and opt.quant_type != ""
+            and opt.quant_type != model_opt.quant_type
+        ):
+            raise ValueError(
+                "Model is a awq quantized model, cannot overwrite with another quant method"
+            )
+
+    elif hasattr(opt, "quant_type") and opt.quant_type not in [
+        "awq_gemm",
+        "awq_gemv",
+    ]:  # we still want to be able to load fp16/32 models with bnb 4bit to minimize ram footprint
+        model_opt.quant_layers = opt.quant_layers
+        model_opt.quant_type = opt.quant_type
+        model_opt.lora_layers = []
+
+    if opt.world_size > 1 and opt.parallel_mode == "tensor_parallel":
+        model_opt.world_size = opt.world_size
+        model_opt.parallel_mode = opt.parallel_mode
+        model_opt.gpu_ranks = opt.gpu_ranks
+        device = torch.device("cuda", device_id)
+        offset = device_id
+    else:
+        if use_gpu(opt):
+            if len(opt.gpu_ranks) > 0:
+                device_id = opt.gpu_ranks[0]
+            elif opt.gpu > -1:
+                device_id = opt.gpu
+            device = torch.device("cuda", device_id)
+        else:
+            device = torch.device("cpu")
+        offset = 0
+
+    if hasattr(opt, "self_attn_type"):
+        model_opt.self_attn_type = opt.self_attn_type
+
     ArgumentParser.update_model_opts(model_opt)
     ArgumentParser.validate_model_opts(model_opt)
+    vocabs = dict_to_vocabs(checkpoint["vocab"])
 
-    base_target_vocab_new = None
-    if opt.new_vocab is not None:
-        vocab_old = checkpoint["vocab"]
-        vocab = torch.load(opt.new_vocab)
-        logger.info("Loaded the new input vocabulary")
-        # print(dict(vocab_old)["tgt"].fields[1][1].vocab.itos)
-        # print(dict(vocab)["tgt"].fields[1][1].vocab.itos)
-        # compare_vocab(vocab, vocab_old)
-    else:
-        vocab = checkpoint["vocab"]
-
-    if opt.target_new_vocab is not None:
-        vocab_old = checkpoint["vocab"]
-        base_target_vocab_new = torch.load(opt.target_new_vocab)
-        logger.info("Loaded the new target vocabulary")
-
-    if inputters.old_style_vocab(vocab):
-        fields = inputters.load_old_vocab(
-            vocab, opt.data_type, dynamic_dict=model_opt.copy_attn
-        )
-    else:
-        fields = vocab
-
-    # if base_target_vocab_new is not None:
-    #     fields['tgt'].fields[0] = (fields['tgt'].fields[0][0], base_target_vocab_new)
-
-    model, fields = build_base_model(
-        model_opt,
-        fields,
-        use_gpu(opt),
-        checkpoint,
-        opt.gpu,
-        base_target_vocab_new,
-        opt.replace_new_vocab_everywhere,
-        test=True
+    # Avoid functionality on inference
+    model_opt.update_vocab = False
+    model_opt.attention_dropout = (
+        0.0  # required to force no dropout at inference with flash
     )
-    if opt.fp32:
-        model.float()
-    model.eval()
-    model.generator.eval()
-    return fields, model, model_opt
 
+    model = build_base_model(model_opt, vocabs)
 
-def build_target_embedding(model_opt, field, device):
-    tgt_out_vectors = field.vocab.vectors
+    precision = torch.float32
 
-    if model_opt.center:
-        center_emb = tgt_out_vectors.sum(dim=0, keepdim=True) / (
-            tgt_out_vectors.size(0)
+    if opt.precision == "fp16":
+        precision = torch.float16
+    elif opt.precision == "int8":
+        if opt.gpu >= 0:
+            raise ValueError("Dynamic 8-bit quantization is not supported on GPU")
+        else:
+            precision = torch.float32
+
+    logger.info("Loading data into the model")
+
+    if "model" in checkpoint.keys():
+        # weights are in the .pt file
+        model.load_state_dict(
+            checkpoint,
+            precision=precision,
+            device=device,
+            strict=True,
+            offset=offset,
         )
-        tgt_out_vectors = tgt_out_vectors - center_emb
-        print("centered (y)")
-        if model_opt.whiten:  # zca whitening
-            _, S, V = tgt_out_vectors.svd(some=True)
-            print("ok")
-            W = V.matmul(torch.diag(1.0 / S)).matmul(V.t())
-            tgt_out_vectors = tgt_out_vectors.matmul(W).detach()
-            print("whitened (y)")
-
-    tgt_out_vectors_unitnorm = nn.functional.normalize(tgt_out_vectors, p=2, dim=1)
-
-    print("NEGUNK =", model_opt.negunk)
-    if model_opt.negunk:
-        print("UNK =", field.unk_token)
-        tgt_out_vectors_unitnorm[
-            field.vocab.stoi[field.unk_token]
-        ] = -tgt_out_vectors_unitnorm[field.vocab.stoi[field.unk_token]]
-
-    # mapping = build_jlmapping(tgt_out_vectors.size(1), trainable=model_opt.emb_map,
-    # map_id_init=model_opt.map_id_init, use_noise=model_opt.jl_noise, device=device)
-    mapping = build_mapping(tgt_out_vectors.size(1), model_opt, device)
-
-    tgt_out_emb = nn.Embedding(tgt_out_vectors.size(0), tgt_out_vectors.size(1))
-    tgt_out_emb.weight.data.copy_(tgt_out_vectors_unitnorm)
-    tgt_out_emb.weight.requires_grad = False  # do not train the embeddings
-
-    tgt_out_emb = nn.Sequential(tgt_out_emb, mapping)
-    # print(tgt_out_emb.parameters())
-    return tgt_out_emb, tgt_out_vectors.size(1)
-
-
-def maybe_load_partial_state_dict(net, state_dict, opt, strict=False, test=False, module="model"):
-    if opt.finetune is None or test:
-        net.load_state_dict(state_dict, strict=strict)
-
-    elif opt.finetune == "regular":
-
-        #TODO: verify state getting loaded ok: DONE
-        own_state = net.state_dict()
-        unupdated_names = []
-        updated_names = []
-        partial_names = []
-        other_names = []
-        reload_dict = {}
-
-        for name, param in state_dict.items():
-            logger.info(name)
-            if name not in own_state:
-                other_names.append(name) 
-                continue
-            
-            if name == "decoder.embeddings.make_embedding.emb_luts.0.0.weight":
-                if "continuous" in opt.generator_function:
-                    other_names.append(name)
-                    reload_dict[name] = own_state[name]
-                    continue
-
-                elif own_state[name].size(0) != param.size(0):  #expand vocabulary
-                    assert own_state[name].size(0) > param.size(0), "you can't reduce vocab size"
-                    logger.info("Decoder embeddings partially initialized since the vocabulary is being expanded")
-                    own_state[name][:param.size(0)] = param
-                    reload_dict[name] = own_state[name]
-                    logger.info(reload_dict[name].size())
-                    partial_names.append(name)
-                    continue
-            
-            if module == "generator" and name == "0.weight" and "continuous" not in opt.generator_function and own_state[name].size(0) != param.size(0):
-                assert own_state[name].size(0) > param.size(0), f"you can't reduce vocab size: old {param.size()} to current {own_state[name].size()}"
-                logger.info("Decoder output embeddings partially initialized since the vocabulary is being expanded")
-                own_state[name][:param.size(0)] = param
-                reload_dict[name] = own_state[name]
-                logger.info(reload_dict[name].size())
-                partial_names.append(name)
-                continue
-                
-            if module == "generator" and name == "0.bias" and "continuous" not in opt.generator_function and own_state[name].size(0) != param.size(0):
-                assert own_state[name].size(0) > param.size(0), "you can't reduce vocab size"
-                logger.info("Decoder output bias partially initialized since the vocabulary is being expanded")
-                own_state[name][:param.size(0)] = param
-                reload_dict[name] = own_state[name]
-                logger.info(reload_dict[name].size())
-                partial_names.append(name)
-                continue
-
-            if "decoder" in name and "tgt_out_emb" in name:
-                other_names.append(name)
-                reload_dict[name] = own_state[name]
-                continue
-            
-            reload_dict[name] = param
-            updated_names.append(name)
-        
-        net.load_state_dict(reload_dict, strict=True)
-        updated_names = set(updated_names)
-        for name, params in own_state.items():
-            if name not in updated_names:
-                if "adapter" not in name:
-                    print(name)
-                params.data.normal_(0.0, 0.02)
-                unupdated_names.append(name)
-
-
-        logger.info(f"{len(updated_names)} modules were used from the checkpoint")
-        logger.info(
-            f"{len(partial_names)} modules in the current model were partially initialized with the checkpoint (vocabulary expansion)"
-        )
-        logger.info(
-            f"{len(other_names)} modules weren't used from the checkpoint"
-        )
-        logger.info(
-            f"{len(unupdated_names)} modules in the current model not initialized with the checkpoint"
-        )
-    elif "copy" in opt.finetune:  #copy-regular or copy-adapter
-        own_state = net.state_dict()
-        unupdated_names = []
-        updated_names = []
-        other_names = []
-        reload_dict = {}
-        
-        for name, param in state_dict.items():
-            #special case
-            if opt.adapt_embeddings and name == "decoder.embeddings.make_embedding.emb_luts.0.1.weight":
-                #input("adapting embeddings hihi")
-                reload_dict[name.replace("0.1", "0.2")] = state_dict[name]
-                updated_names.append(name.replace("0.1", "0.2"))
-                continue
-                
-            if name not in own_state:
-                other_names.append(name) 
-                continue
-            
-            if name == "decoder.embeddings.make_embedding.emb_luts.0.0.weight" and "continuous" in opt.generator_function:
-                input("adasdasf")
-                other_names.append(name)
-                reload_dict[name] = own_state[name]
-                continue
-
-            # if opt.new_positional_embeddings and "decoder.embeddings.make_embedding.pe" in name:
-            #     input("yass")
-            #     other_names.append(name)
-            #     reload_dict[name] = own_state[name]
-            #     continue
-
-            if "decoder" in name and "tgt_out_emb" in name:
-                other_names.append(name)
-                reload_dict[name] = own_state[name]
-                continue
-            
-            reload_dict[name] = param
-            updated_names.append(name)
-        
-        for name, param in own_state.items():
-            if name not in reload_dict:
-                param.data.normal_(0.0, 0.02) #may be something else?
-                reload_dict[name] = param        
-        
-        net.load_state_dict(reload_dict, strict=True)
-        updated_names = set(updated_names)
-
-        logger.info("The following params are being randomly initialized")
-        for name in own_state:
-            if name not in updated_names:
-                logger.info(name)
-                unupdated_names.append(name)
-        logger.info(
-            f"This totals to {len(unupdated_names)} modules"
-        )
-
-        logger.info("Following models are not being initialized from the checkpoint")
-        for name in other_names:
-            logger.info(name)
-        logger.info(
-            f"This totals to {len(other_names)} modules"
-        )  
-
-        logger.info(f"Finally, {len(updated_names)} modules were used from the checkpoint")
     else:
-        #TODO: verify state getting loaded ok
-        own_state = net.state_dict()
-        unupdated_names = []
-        updated_names = []
-        other_names = []
-        reload_dict = {}
-        
-        for name, param in state_dict.items():
-            
-            #special case
-            if opt.adapt_embeddings and name == "decoder.embeddings.make_embedding.emb_luts.0.1.weight":
-                #input("adapting embeddings hihi")
-                reload_dict[name.replace("0.1", "0.2")] = state_dict[name]
-                updated_names.append(name.replace("0.1", "0.2"))
-                continue
-
-            if name not in own_state:
-                other_names.append(name) 
-                continue
-            
-            if name == "decoder.embeddings.make_embedding.emb_luts.0.0.weight" and "continuous" in opt.generator_function:
-                # input("adasdasf")
-                other_names.append(name)
-                reload_dict[name] = own_state[name]
-                continue
-                
-            # if opt.new_positional_embeddings and "decoder.embeddings.make_embedding.pe" in name:
-            #     input("yass")
-            #     other_names.append(name)
-            #     reload_dict[name] = own_state[name]
-            #     continue
-
-            if "decoder" in name and "tgt_out_emb" in name:
-                other_names.append(name)
-                reload_dict[name] = own_state[name]
-                continue
-            
-            reload_dict[name] = param
-            updated_names.append(name)
-        
-        for name, param in own_state.items():
-            if name not in reload_dict:
-                param.data.normal_(0.0, 0.02) #may be something else?
-                reload_dict[name] = param        
-        
-        net.load_state_dict(reload_dict, strict=True)
-        updated_names = set(updated_names)
-
-        logger.info("The following params are being randomly initialized")
-        for name in own_state:
-            if name not in updated_names:
-                logger.info(name)
-                unupdated_names.append(name)
-        logger.info(
-            f"This totals to {len(unupdated_names)} modules"
+        # weights are not in the .pt checkpoint but stored in the safetensors file
+        base_name = model_path[:-3] if model_path[-3:] == ".pt" else model_path
+        model.load_safe_state_dict(
+            base_name,
+            precision=precision,
+            device=device,
+            strict=True,
+            offset=offset,
         )
 
-        logger.info("Following models are not being initialized from the checkpoint")
-        for name in other_names:
-            logger.info(name)
-        logger.info(
-            f"This totals to {len(other_names)} modules"
-        )  
+    if opt.precision == torch.int8:
+        torch.quantization.quantize_dynamic(model, dtype=torch.qint8, inplace=True)
 
-        logger.info(f"Finally, {len(updated_names)} modules were used from the checkpoint")
+    del checkpoint
+
+    model.eval()
+    for name, module in model.named_modules():
+        if hasattr(module, "dropout_p"):
+            module.dropout_p = 0.0
+
+    return vocabs, model, model_opt
 
 
-def build_base_model(
-    model_opt,
-    fields,
-    gpu,
-    checkpoint=None,
-    gpu_id=None,
-    new_tgt_vocab=None,
-    replace_new_vocab_everywhere=False,
-    test=False
+def build_src_emb(model_opt, vocabs):
+    # Build embeddings.
+    if model_opt.model_type == "text":
+        src_emb = build_embeddings(model_opt, vocabs)
+    else:
+        src_emb = None
+    return src_emb
+
+
+def build_encoder_with_embeddings(model_opt, vocabs):
+    # Build encoder.
+    src_emb = build_src_emb(model_opt, vocabs)
+    encoder = build_encoder(model_opt, src_emb)
+    return encoder, src_emb
+
+
+def build_decoder_with_embeddings(
+    model_opt, vocabs, share_embeddings=False, src_emb=None
 ):
+    # Build embeddings.
+    tgt_emb = build_embeddings(model_opt, vocabs, for_encoder=False)
+
+    if share_embeddings:
+        tgt_emb.word_lut.weight = src_emb.word_lut.weight
+
+    # Build decoder.
+    decoder = build_decoder(model_opt, tgt_emb)
+    return decoder, tgt_emb
+
+
+def build_task_specific_model(model_opt, vocabs):
+    # Share the embedding matrix - preprocess with share_vocab required.
+    if model_opt.share_embeddings:
+        # src/tgt vocab should be the same if `-share_vocab` is specified.
+        assert (
+            vocabs["src"] == vocabs["tgt"]
+        ), "preprocess with -share_vocab if you use share_embeddings"
+
+    if model_opt.model_task == ModelTask.SEQ2SEQ:
+        encoder, src_emb = build_encoder_with_embeddings(model_opt, vocabs)
+        decoder, _ = build_decoder_with_embeddings(
+            model_opt,
+            vocabs,
+            share_embeddings=model_opt.share_embeddings,
+            src_emb=src_emb,
+        )
+        return NMTModel(encoder=encoder, decoder=decoder)
+    elif model_opt.model_task == ModelTask.LANGUAGE_MODEL:
+        src_emb = build_src_emb(model_opt, vocabs)
+        decoder, _ = build_decoder_with_embeddings(
+            model_opt, vocabs, share_embeddings=True, src_emb=src_emb
+        )
+        return LanguageModel(decoder=decoder)
+    else:
+        raise ValueError(f"No model defined for {model_opt.model_task} task")
+
+
+def use_embeddings_from_checkpoint(vocabs, model, checkpoint):
+    # Update vocabulary embeddings with checkpoint embeddings
+    logger.info("Updating vocabulary embeddings with checkpoint embeddings")
+    # Embedding layers
+    enc_emb_name = "encoder.embeddings.make_embedding.emb_luts.0.weight"
+    dec_emb_name = "decoder.embeddings.make_embedding.emb_luts.0.weight"
+    model_dict = {k: v for k, v in model.state_dict().items() if "generator" not in k}
+    generator_dict = model.generator.state_dict()
+    for side, emb_name in [("src", enc_emb_name), ("tgt", dec_emb_name)]:
+        if emb_name not in checkpoint["model"]:
+            continue
+        new_tokens = []
+        ckp_vocabs = dict_to_vocabs(checkpoint["vocab"])
+        for i, tok in enumerate(vocabs[side].ids_to_tokens):
+            if tok in ckp_vocabs[side]:
+                old_i = ckp_vocabs[side].lookup_token(tok)
+                model_dict[emb_name][i] = checkpoint["model"][emb_name][old_i]
+                if side == "tgt":
+                    generator_dict["weight"][i] = checkpoint["generator"]["weight"][
+                        old_i
+                    ]
+                    generator_dict["bias"][i] = checkpoint["generator"]["bias"][old_i]
+            else:
+                # Just for debugging purposes
+                new_tokens.append(tok)
+        logger.info("%s: %d new tokens" % (side, len(new_tokens)))
+
+        # Remove old vocabulary associated embeddings
+        del checkpoint["model"][emb_name]
+    del checkpoint["generator"]["weight"], checkpoint["generator"]["bias"]
+    fake_ckpt = {"model": model_dict, "generator": generator_dict}
+    model.load_state_dict(fake_ckpt)
+
+
+def build_base_model(model_opt, vocabs):
     """Build a model from opts.
 
     Args:
         model_opt: the option loaded from checkpoint. It's important that
             the opts have been updated and validated. See
             :class:`onmt.utils.parse.ArgumentParser`.
-        fields (dict[str, torchtext.data.Field]):
+        vocabs (dict[str, Vocab]):
             `Field` objects for the model.
-        gpu (bool): whether to use gpu.
-        checkpoint: the model gnerated by train phase, or a resumed snapshot
-                    model from a stopped training.
-        gpu_id (int or NoneType): Which GPU to use.
 
     Returns:
         the NMTModel.
     """
-    if gpu and gpu_id is not None:
-        device = torch.device("cuda", gpu_id)
-    elif gpu and not gpu_id:
-        device = torch.device("cuda")
-    elif not gpu:
-        device = torch.device("cpu")
 
     # for back compat when attention_dropout was not defined
     try:
@@ -566,126 +304,120 @@ def build_base_model(
     except AttributeError:
         model_opt.attention_dropout = model_opt.dropout
 
-    tgt_field = fields["tgt"]
-    # Build embeddings.
-    if model_opt.model_type == "text" or model_opt.model_type == "vec":
-        src_field = fields["src"]
-        src_emb = build_embeddings(model_opt, src_field)
-        encoder_tgt_emb=None
-        if model_opt.finetune is not None and "copy" in model_opt.finetune:
-            encoder_tgt_emb = build_embeddings(model_opt, tgt_field) # another embedding table for copy stuff
+    # Build Model
+    model = build_task_specific_model(model_opt, vocabs)
 
-    else:
-        src_emb = None
+    nonlora_to_quant = [
+        layer
+        for layer in getattr(model_opt, "quant_layers", [])
+        if layer not in getattr(model_opt, "lora_layers", [])
+    ]
 
-    # Build encoder.
-    encoder = build_encoder(model_opt, src_emb, tgt_embeddings=encoder_tgt_emb)
-
-    # Build decoder.
-    
-    tgt_emb = build_embeddings(model_opt, tgt_field, for_encoder=False)
-
-    # Share the embedding matrix - preprocess with share_vocab required.
-    if model_opt.share_embeddings:
-        # src/tgt vocab should be the same if `-share_vocab` is specified.
-        assert (
-            src_field.base_field.vocab == tgt_field.base_field.vocab
-        ), "preprocess with -share_vocab if you use share_embeddings"
-
-        tgt_emb.word_lut.weight = src_emb.word_lut.weight
-
-    decoder = build_decoder(model_opt, tgt_emb)
-
-    output_vec_dim = -1
-    if "continuous" in model_opt.generator_function:
-        # make target embeddings
-        tgt_out_emb, output_vec_dim = build_target_embedding(
-            model_opt, tgt_field.base_field, device
-        )
-
-        if new_tgt_vocab is not None:
-            new_tgt_out_emb, output_vec_dim = build_target_embedding(
-                model_opt, new_tgt_vocab, device
+    if hasattr(model_opt, "quant_layers") and len(nonlora_to_quant) > 0:
+        if model_opt.quant_type in ["bnb_8bit", "bnb_FP4", "bnb_NF4"]:
+            logger.info(
+                "%s compression of layer %s" % (model_opt.quant_type, nonlora_to_quant)
             )
-            # fields['new_tgt'] = new_tgt_vocab
+            try:
+                from onmt.modules.bnb_linear import replace_bnb_linear
+            except ImportError:
+                raise ImportError("Install bitsandbytes to use 4/8bit compression")
+            model = replace_bnb_linear(
+                model, module_to_convert=nonlora_to_quant, q_type=model_opt.quant_type
+            )
+        elif model_opt.quant_type in ["awq_gemm", "awq_gemv"]:
+            logger.info(
+                "%s compression of layer %s" % (model_opt.quant_type, nonlora_to_quant)
+            )
+            try:
+                from onmt.modules.awq_linear import replace_awq_linear
+            except ImportError:
+                raise ImportError("Install AutoAWQ to use awq quantized model")
+            model = replace_awq_linear(
+                model,
+                module_to_convert=nonlora_to_quant,
+                w_bit=model_opt.w_bit,
+                group_size=model_opt.group_size,
+                q_type=model_opt.quant_type,
+            )
+        else:
+            logger.info("compression type %s not supported." % model_opt.quant_type)
 
-    # Build NMTModel(= encoder + decoder).
-    model = onmt.models.NMTModel(encoder, decoder)
-
-    # Generator
-    generator, mtl_generator = build_generator(
-        model_opt, fields, output_vec_dim=output_vec_dim, device=device
-    )
-
-    # Load the model states from checkpoint or initialize them.
-    if checkpoint is not None:
-        # This preserves backward-compat for models using customed layernorm
-        def fix_key(s):
-            s = re.sub(r"(.*)\.layer_norm((_\d+)?)\.b_2", r"\1.layer_norm\2.bias", s)
-            s = re.sub(r"(.*)\.layer_norm((_\d+)?)\.a_2", r"\1.layer_norm\2.weight", s)
-            return s
-
-        checkpoint["model"] = {fix_key(k): v for k, v in checkpoint["model"].items()}
-        # end of patch for backward compatibility
-
-        # print(list(checkpoint['model'].keys()))
-
-        maybe_load_partial_state_dict(
-            model, checkpoint["model"], model_opt, strict=False, test=test
+    mark_lora = False
+    if hasattr(model_opt, "lora_layers") and len(model_opt.lora_layers) > 0:
+        if model_opt.freeze_encoder or model_opt.freeze_decoder:
+            raise ValueError("Cannot use LoRa with Enc/Dec-oder freezing")
+        for layer in model_opt.lora_layers:
+            if hasattr(model_opt, "quant_layers") and layer in model_opt.quant_layers:
+                quant_type = model_opt.quant_type
+            else:
+                quant_type = None
+            logger.info("Adding LoRa layers for %s quant %s" % (layer, quant_type))
+            model = replace_lora_linear(
+                model,
+                r=model_opt.lora_rank,
+                lora_alpha=model_opt.lora_alpha,
+                lora_dropout=model_opt.lora_dropout,
+                layer=layer,
+                quant_type=quant_type,
+                use_ckpting=model_opt.use_ckpting,
+            )
+        mark_lora = True
+    if hasattr(model_opt, "lora_embedding") and model_opt.lora_embedding:
+        if model_opt.freeze_encoder or model_opt.freeze_decoder:
+            raise ValueError("Cannot use LoRa with Enc/Dec-oder freezing")
+        logger.info("Adding LoRa Embeddings")
+        model = replace_lora_embedding(
+            model, r=model_opt.lora_rank, lora_alpha=model_opt.lora_alpha
         )
-        logger.info(checkpoint["generator"].keys())
-        maybe_load_partial_state_dict(
-            generator, checkpoint["generator"], model_opt, strict=False, test=test, module="generator"
+        mark_lora = True
+
+    if mark_lora:
+        mark_only_lora_as_trainable(model, bias="lora_only")
+
+    # Build Generator.
+    if not model_opt.copy_attn:
+        generator = skip_init(
+            nn.Linear,
+            in_features=model_opt.dec_hid_size,
+            out_features=len(vocabs["tgt"]),
         )
-
-        # model.load_state_dict(checkpoint["model"], strict=False)
-        # generator.load_state_dict(checkpoint["generator"], strict=False)
-        # print(checkpoint.keys())
-        if (
-            "continuous" in model_opt.generator_function
-            and "tgt_out_emb" in checkpoint
-            and model_opt.finetune is None
-        ):
-            tgt_out_emb.load_state_dict(checkpoint["tgt_out_emb"], strict=False)
-        # if hasattr(model.decoder, 'tgt_out_emb'):
-        #     tgt_out_emb = model.decoder.tgt_out_emb
-        # else:
-        #     print("hallelujah")
-        # if 'tgt_out_emb' in checkpoint:
-        # tgt_out_emb.load_state_dict(checkpoint['tgt_out_emb'], strict=False)
-        if (
-            mtl_generator is not None and "mtl_generator" in checkpoint
-        ):  # the second argument is when one loads a nonmultitask model and trains a multitask predictor on it
-            mtl_generator.load_state_dict(checkpoint["mtl_generator"], strict=False)
-        elif mtl_generator is not None:
-            if model_opt.param_init != 0.0:
-                for p in mtl_generator.parameters():
-                    p.data.uniform_(-model_opt.param_init, model_opt.param_init)
-                for p in mtl_generator.parameters():
-                    p.data.uniform_(-model_opt.param_init, model_opt.param_init)
-            if model_opt.param_init_glorot:
-                for p in mtl_generator.parameters():
-                    if p.dim() > 1:
-                        xavier_uniform_(p)
-                for p in mtl_generator.parameters():
-                    if p.dim() > 1:
-                        xavier_uniform_(p)
-
+        if model_opt.share_decoder_embeddings:
+            generator.weight = model.decoder.embeddings.word_lut.weight
     else:
-        if model_opt.param_init != 0.0:
-            for p in model.parameters():
-                p.data.uniform_(-model_opt.param_init, model_opt.param_init)
-            for p in generator.parameters():
-                p.data.uniform_(-model_opt.param_init, model_opt.param_init)
-        if model_opt.param_init_glorot:
-            for p in model.parameters():
-                if p.dim() > 1:
-                    xavier_uniform_(p)
-            for p in generator.parameters():
-                if p.dim() > 1:
-                    xavier_uniform_(p)
+        vocab_size = len(vocabs["tgt"])
+        pad_idx = vocabs["tgt"][DefaultTokens.PAD]
+        generator = CopyGenerator(model_opt.dec_hid_size, vocab_size, pad_idx)
+        if model_opt.share_decoder_embeddings:
+            generator.linear.weight = model.decoder.embeddings.word_lut.weight
 
-        if hasattr(model.encoder, "embeddings"):
+    model.generator = generator
+
+    return model
+
+
+def build_model(model_opt, opt, vocabs, checkpoint, device_id):
+    logger.info("Building model...")
+
+    model = build_base_model(model_opt, vocabs)
+
+    # If new training initialize the model params
+    # If update_vocab init also but checkpoint will overwrite old weights
+    if checkpoint is None or model_opt.update_vocab:
+        if model_opt.param_init != 0.0:
+            for param in model.parameters():
+                uniform_(param, -model_opt.param_init, model_opt.param_init)
+        elif model_opt.param_init_glorot:
+            for name, module in model.named_modules():
+                for param_name, param in module.named_parameters():
+                    if param_name == "weight" and param.dim() > 1:
+                        xavier_uniform_(param)
+                    elif param_name == "bias":
+                        zeros_(param)
+        else:
+            raise ValueError("You need either param_init != 0 OR init_glorot True")
+
+        if hasattr(model, "encoder") and hasattr(model.encoder, "embeddings"):
             model.encoder.embeddings.load_pretrained_vectors(
                 model_opt.pre_word_vecs_enc
             )
@@ -694,46 +426,78 @@ def build_base_model(
                 model_opt.pre_word_vecs_dec
             )
 
-    model.generator = generator
-    model.mtl_generator = mtl_generator
-    if "continuous" in model_opt.generator_function:
-        if new_tgt_vocab is not None:
-            model.decoder.new_tgt_out_emb = new_tgt_out_emb
-            if replace_new_vocab_everywhere:
-                tgt_out_emb = new_tgt_out_emb
-                fields["tgt"].fields[0] = (fields["tgt"].fields[0][0], new_tgt_vocab)
+    # ONLY for legacy fusedam with amp pytorch requires NOT to half the model
+    if (
+        model_opt.model_dtype == "fp16"
+        and model_opt.apex_opt_level not in ["O0", "O1", "O2", "O3"]
+        and model_opt.optim == "fusedadam"
+    ):
+        precision = torch.float16
+        logger.info("Switching model to half() for FusedAdam legacy")
+        logger.info("Non quantized layer compute is %s", model_opt.model_dtype)
+    else:
+        precision = torch.float32
+        logger.info("Switching model to float32 for amp/apex_amp")
+        logger.info("Non quantized layer compute is %s", model_opt.model_dtype)
+
+    if opt.world_size > 1 and opt.parallel_mode == "tensor_parallel":
+        device = torch.device("cuda")
+        offset = device_id
+    else:
+        if use_gpu(opt):
+            device = torch.device("cuda")
         else:
-            model.decoder.new_tgt_out_emb = None
+            device = torch.device("cpu")
+        offset = 0
 
-        model.decoder.tgt_out_emb = tgt_out_emb
+    if checkpoint is not None:
+        if model_opt.update_vocab:
+            if "model" in checkpoint.keys():
+                # Update model embeddings with those from the checkpoint
+                # after initialization
+                use_embeddings_from_checkpoint(vocabs, model, checkpoint)
+                # after this checkpoint contains no embeddings
+            else:
+                raise ValueError(
+                    "Update Vocab is not compatible with safetensors mode (yet"
+                )
 
-        if model_opt.finetune is not None and "copy_tgt_pretrained" in model_opt.finetune:  #initialize encoder tgt input embedding with out decoder tgt input embedding
-            model.encoder.tgt_embeddings = tgt_out_emb
-             
-        if model_opt.share_decoder_embeddings:
-            model.decoder.embeddings.tie_embeddings(tgt_out_emb[0].weight)
+        # when using LoRa or updating the vocab (no more embeddings in ckpt)
+        # => strict=False when loading state_dict
+        strict = not model_opt.update_vocab
 
-        if model_opt.tie_embedding_adapters:
-            model.decoder.embeddings.tie_adapters(model.generator[-1])
+        if "model" in checkpoint.keys():
+            # weights are in the .pt file
+            model.load_state_dict(
+                checkpoint,
+                precision=precision,
+                device=device,
+                strict=strict,
+                offset=offset,
+            )
+        else:
+            # weights are not in the .pt checkpoint but stored in the safetensors file
+            model_path = (
+                opt.train_from[:-3] if opt.train_from[-3:] == ".pt" else opt.train_from
+            )
+            model.load_safe_state_dict(
+                model_path,
+                precision=precision,
+                device=device,
+                strict=strict,
+                offset=offset,
+            )
+    else:
+        model.to(precision)
+        model.to(device)
 
-    model.to(device)
-    if model_opt.model_dtype == "fp16" and model_opt.optim == "fusedadam":
-        model.half()
-    return model, fields
+    if model_opt.freeze_encoder:
+        model.encoder.requires_grad_(False)
+        model.encoder.embeddings.requires_grad_()
 
+    if model_opt.freeze_decoder:
+        model.decoder.requires_grad_(False)
+        model.decoder.embeddings.requires_grad_()
 
-def build_model(model_opt, opt, fields, checkpoint):
-    base_target_vocab_new = None
-    if opt.target_new_vocab is not None:
-        base_target_vocab_new = torch.load(opt.target_new_vocab)
-        logger.info(
-            "Loaded the new target vocabulary of dimension: "
-            + str(base_target_vocab_new.vocab.vectors.size())
-        )
-
-    logger.info("Building model...")
-    model, fields = build_base_model(
-        model_opt, fields, use_gpu(opt), checkpoint, new_tgt_vocab=base_target_vocab_new
-    )
     logger.info(model)
-    return model, fields
+    return model
