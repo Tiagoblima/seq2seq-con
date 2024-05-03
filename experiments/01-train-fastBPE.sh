@@ -1,7 +1,7 @@
 # learning BPE codes
-SRC_LANG="eng"
-STD_LANG="gun"
-TGT_LANG="gub"
+SRC_LANG=$1
+STD_LANG=$2
+TGT_LANG=$3
 VOCAB_SIZE=24000
 BASE_DIR=/home/tiagoblima/repos/seq2seq-con/data/preprocessed/texts/
 

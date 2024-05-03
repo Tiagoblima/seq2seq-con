@@ -9,7 +9,6 @@ for i in $(eval echo {0..${TRAINSTEPS}..${SAVESTEPS}}); do
         echo "Evaluating checkpoint ... ${i}"
         python -u ../translate.py\
             -gpu 0\
-            -decode_loss cosine\
             -model $SRCSTD_MODELDIR/checkpoint_step_${i}.pt\
             -src $SRC_LANG-$STD_LANG/bpetok/valid.$SRC_LANG.bpetok\
             -output $SRCSTD_MODELDIR/step_${i}.pred.$STD_LANG\
