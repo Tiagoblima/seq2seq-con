@@ -1,0 +1,71 @@
+
+## Where the samples will be written
+save_data: eng-gun/data
+## Where the vocab(s) will be written
+src_vocab: eng-gun/data/vocab-train.src
+tgt_vocab: eng-gun/data/vocab-train.tgt
+# Prevent overwriting existing files in the folder
+overwrite: False
+
+# Corpus opts:
+data:
+    corpus_1:
+        path_src: ../data/preprocessed/texts/nllb/eng/train.txt
+        path_tgt: ../data/preprocessed/texts/nllb/gun/train.txt
+    valid:
+        path_src: ../data/preprocessed/texts/nllb/eng/validation.txt
+        path_tgt: ../data/preprocessed/texts/nllb/gun/validation.txt
+
+accum_count:
+- 2
+accum_steps:
+- 0
+gpu_ranks:
+- 0
+world_size: 1
+gpu_verbose_level: 0
+train_from: ''
+train_steps: 350000
+train_with: train
+decay_steps: 10000
+decay_method: rsqrt
+valid_steps: 2000
+start_decay_steps: 50000
+truncated_decoder: 0
+warmup_end_lr: 0.0007
+warmup_init_lr: 1.0e-08
+warmup_steps: 2000
+weight_decay: 1.0e-05
+window_size: 0.02
+learning_rate: 1
+save_checkpoint_steps: 50000
+tensorboard: 'true'
+tensorboard_log_dir: eng-gun/checkpoints/logs/
+save_model: eng-gun/checkpoints/checkpoint
+seed: -1
+self_attn_type: scaled-dot
+share_decoder_embeddings: 'true'
+transformer_ff: 1024
+src_word_vec_size: 512
+tgt_word_vec_size: 512
+enc_hid_size: 512
+dec_hid_size: 512
+word_vec_size: 512
+state_dim: 512
+embeddings_type: "word2vec"
+tgt_embeddings:  eng-gun/embeddings/gun.vec
+encoder_type: transformer
+decoder_type: transformer
+heads: 8
+dropout:
+- 0.1
+dropout_steps:
+- 0
+early_stopping: 5
+batch_size: 4000
+valid_batch_size: 2000
+batch_type: tokens
+apex_opt_level: O1
+src_words_min_frequency: 1
+with_score: 'true'
+n_best: 5
