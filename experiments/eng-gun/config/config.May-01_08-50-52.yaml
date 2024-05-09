@@ -23,7 +23,6 @@ accum_steps:
 gpu_ranks:
 - 0
 world_size: 1
-optim: adam
 gpu_verbose_level: 0
 train_from: ''
 train_steps: 350000
@@ -35,14 +34,11 @@ start_decay_steps: 50000
 truncated_decoder: 0
 warmup_end_lr: 0.0007
 warmup_init_lr: 1.0e-08
-warmup_steps: 2000
+warmup_steps: 20000
 weight_decay: 1.0e-05
 window_size: 0.02
 learning_rate: 1
-adam_beta2: 0.98
-adam_beta1: 0.9
 save_checkpoint_steps: 50000
-valid_metrics: ["BLEU"]
 tensorboard: 'true'
 tensorboard_log_dir: eng-gun/checkpoints/logs/
 save_model: eng-gun/checkpoints/checkpoint
@@ -57,6 +53,7 @@ dec_hid_size: 512
 word_vec_size: 512
 state_dim: 512
 embeddings_type: "word2vec"
+tgt_embeddings:  eng-gun/embeddings/gun.vec
 encoder_type: transformer
 decoder_type: transformer
 heads: 8

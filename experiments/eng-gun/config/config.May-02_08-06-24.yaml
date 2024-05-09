@@ -23,7 +23,6 @@ accum_steps:
 gpu_ranks:
 - 0
 world_size: 1
-optim: adam
 gpu_verbose_level: 0
 train_from: ''
 train_steps: 350000
@@ -39,10 +38,7 @@ warmup_steps: 2000
 weight_decay: 1.0e-05
 window_size: 0.02
 learning_rate: 1
-adam_beta2: 0.98
-adam_beta1: 0.9
 save_checkpoint_steps: 50000
-valid_metrics: ["BLEU"]
 tensorboard: 'true'
 tensorboard_log_dir: eng-gun/checkpoints/logs/
 save_model: eng-gun/checkpoints/checkpoint
