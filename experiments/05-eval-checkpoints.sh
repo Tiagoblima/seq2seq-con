@@ -14,7 +14,7 @@ for i in $(eval echo {${SAVESTEPS}..${TRAINSTEPS}..${SAVESTEPS}}); do
             -output $SRCSTD_MODELDIR/step_${i}.pred.$STD_LANG\
             -batch_size 4000\
             -batch_type tokens\
-            -beam_size 1\
+            -beam_size 5\
             -replace_unk 
         source ./evaluate.sh $SRCSTD_MODELDIR/step_${i}.pred.$STD_LANG $SRC_LANG-$STD_LANG/bpetok/valid.$STD_LANG.bpetok $STD_LANG
         #else
