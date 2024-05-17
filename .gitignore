@@ -7,7 +7,8 @@ __pycache__/
 *.so
 seq2seq-venv
 third_party
-data
+data/preprocessed
+data/raw
 # Distribution / packaging
 .Python
 build/
